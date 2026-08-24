@@ -1,8 +1,6 @@
 import os
 import json
 import time
-import random
-import hashlib
 import asyncio
 import logging
 import platform
@@ -705,71 +703,30 @@ class LevelingXBot(
         intents.members = True
         intents.voice_states = True
 
+        # ใช้ commands.when_mentioned_or แทน Prefix ตายตัวอย่าง "!" -
+        # Bot นี้ใช้ Slash Commands เป็นหลัก ไม่มี Prefix Command ใด ๆ
+        # จริง แต่ discord.py (commands.Bot) ยังคงต้องการค่า
+        # command_prefix เสมอ การ Mention ตรวจจับได้โดยไม่ต้องเปิด
+        # Message Content Intent เพราะข้อความที่ Mention บอทได้รับการ
+        # ยกเว้นจาก Discord อยู่แล้ว
+
         super().__init__(
-            command_prefix="!",
+            command_prefix=commands.when_mentioned_or("!"),
             intents=intents
         )
 
         self.bot_start_time = time.time()
-
-    def _build_commands_signature(
-        self,
-        guild: discord.Object
-    ):
-        """
-        สร้างลายเซ็น (hash) ของชุดคำสั่ง Slash Command ปัจจุบัน (ชื่อ,
-        คำอธิบาย, พารามิเตอร์) เพื่อใช้เปรียบเทียบว่าคำสั่งมีการ
-        เปลี่ยนแปลงจริงหรือไม่ ก่อนจะยิง tree.sync() ไปยัง Discord API
-        ป้องกันไม่ให้ทุกครั้งที่บอท Restart (เช่นตอนเกิด Crash Loop)
-        ต้องยิง Sync ซ้ำโดยไม่จำเป็น ซึ่งเป็นสาเหตุหนึ่งที่ทำให้โดน
-        Rate Limit (429) หนักขึ้น
-        """
-
-        commands_list = self.tree.get_commands(
-            guild=guild
-        )
-
-        signature_items = []
-
-        for cmd in sorted(
-            commands_list,
-            key=lambda c: c.name
-        ):
-
-            options = []
-
-            if isinstance(cmd, app_commands.Command):
-
-                for param in cmd.parameters:
-
-                    options.append([
-                        param.name,
-                        str(param.type),
-                        bool(param.required)
-                    ])
-
-            signature_items.append({
-                "name": cmd.name,
-                "description": cmd.description,
-                "options": options
-            })
-
-        raw = json.dumps(
-            signature_items,
-            sort_keys=True,
-            ensure_ascii=False
-        )
-
-        return hashlib.sha256(
-            raw.encode("utf-8")
-        ).hexdigest()
 
     async def setup_hook(
         self
     ):
 
         # ---------------------------------------------
-        # Persistent Views
+        # Persistent Views (ลงทะเบียนเสมอ ไม่ว่าจะอยู่โหมดไหน)
+        # ---------------------------------------------
+        # ต้องลงทะเบียนก่อนเสมอเพื่อให้ Component (custom_id เดิม:
+        # levelingx:report / levelingx:accept / levelingx:close) ทำงาน
+        # ต่อได้หลัง Restart โดยไม่ขึ้นกับว่าจะ Sync คำสั่งหรือไม่
         # ---------------------------------------------
 
         self.add_view(
@@ -781,56 +738,47 @@ class LevelingXBot(
         )
 
         # ---------------------------------------------
-        # Sync เฉพาะ Server ส่วนตัว
+        # Command Sync - ควบคุมด้วย Environment Variable เท่านั้น
         # ---------------------------------------------
-        # ยิง tree.sync() เฉพาะเมื่อชุดคำสั่งเปลี่ยนแปลงจริง หรือยังไม่เคย
-        # Sync มาก่อนเท่านั้น เพื่อลดจำนวนครั้งที่เรียก Discord API โดย
-        # ไม่จำเป็น (โดยเฉพาะตอนบอท Restart ถี่ ๆ) ซึ่งเป็นสาเหตุหนึ่งที่
-        # ทำให้เจอ 429 Too Many Requests ง่ายขึ้น
-        # สามารถบังคับ Sync ใหม่เสมอได้ด้วยการตั้ง Environment Variable
-        # FORCE_COMMAND_SYNC=1 (เช่น หลัง Deploy โค้ดที่เพิ่ม/แก้คำสั่งใหม่)
+        # ค่า Default: COMMAND_SYNC=0 -> ไม่เรียก tree.sync() เลย ไม่ว่า
+        # กรณีใด ๆ (ไม่ใช้ data.json หรือ Hash ใด ๆ มาตัดสินใจอีกต่อไป
+        # เพราะ Filesystem ของ Render Free อาจไม่ถาวร ทำให้ข้อมูลที่ใช้
+        # ตัดสินใจหายไปได้โดยไม่คาดคิด)
+        #
+        # COMMAND_SYNC=1 -> เข้าสู่ "โหมด Sync ครั้งเดียว": Sync คำสั่ง
+        # ไปยัง Guild ที่กำหนด แล้วปิด Bot ลงทันที (ไม่เชื่อมต่อ Gateway
+        # ต่อ ไม่ทำงานเป็นบอทตามปกติในรอบนี้) เพื่อให้ Process จบแบบ
+        # สะอาด ไม่มี Sync ซ้ำ ไม่มี Retry Loop ผู้ดูแลต้องตั้งค่ากลับ
+        # เป็น COMMAND_SYNC=0 แล้ว Deploy/Restart อีกครั้งเพื่อให้บอท
+        # กลับมาทำงานตามปกติ
         # ---------------------------------------------
 
-        if GUILD_ID:
+        command_sync_enabled = os.getenv(
+            "COMMAND_SYNC",
+            "0"
+        ).strip() == "1"
 
-            guild = discord.Object(
-                id=GUILD_ID
-            )
+        if command_sync_enabled:
 
-            self.tree.copy_global_to(
-                guild=guild
-            )
+            self._command_sync_ok = False
 
-            try:
+            if not GUILD_ID:
 
-                current_signature = self._build_commands_signature(
-                    guild
+                log.error(
+                    "COMMAND_SYNC=1 ถูกตั้งไว้ แต่ไม่มี GUILD_ID ที่ถูกต้อง "
+                    "- ไม่สามารถ Sync ได้ จะหยุด Process (ไม่ทำงานเป็นบอท "
+                    "ต่อในรอบนี้)"
                 )
 
-            except Exception:
+            else:
 
-                log.exception(
-                    "Failed to build command signature - will sync to be safe"
+                guild = discord.Object(
+                    id=GUILD_ID
                 )
 
-                current_signature = None
-
-            stored_signature = data.get(
-                "_last_synced_command_signature"
-            )
-
-            force_sync = os.getenv(
-                "FORCE_COMMAND_SYNC",
-                ""
-            ).strip() == "1"
-
-            needs_sync = (
-                force_sync
-                or current_signature is None
-                or current_signature != stored_signature
-            )
-
-            if needs_sync:
+                self.tree.copy_global_to(
+                    guild=guild
+                )
 
                 try:
 
@@ -838,33 +786,45 @@ class LevelingXBot(
                         guild=guild
                     )
 
-                    if current_signature is not None:
-
-                        data["_last_synced_command_signature"] = current_signature
-
-                        await persist_data()
-
                     log.info(
-                        "Commands synced to guild %s (%d commands)",
-                        GUILD_ID,
-                        len(synced)
+                        "COMMAND_SYNC=1: Sync สำเร็จ %d คำสั่ง ไปยัง Guild "
+                        "%s แล้ว - กรุณาตั้งค่า COMMAND_SYNC=0 กลับ แล้ว "
+                        "Deploy/Restart อีกครั้งเพื่อให้บอทกลับมาทำงาน "
+                        "ตามปกติ (ไม่เช่นนั้นทุก Restart จะ Sync ซ้ำและจบ "
+                        "Process ทันทีแบบนี้ไปเรื่อย ๆ)",
+                        len(synced),
+                        GUILD_ID
                     )
+
+                    self._command_sync_ok = True
 
                 except discord.HTTPException:
 
                     log.exception(
-                        "Failed to sync commands to guild %s (will retry on next "
-                        "successful startup)",
+                        "COMMAND_SYNC=1: Sync ล้มเหลวสำหรับ Guild %s",
                         GUILD_ID
                     )
 
-            else:
+            # โหมด Sync ครั้งเดียว: ปิด Bot ทันทีหลัง Sync (สำเร็จหรือไม่
+            # ก็ตาม) ไม่เชื่อมต่อ Gateway ต่อ ไม่ Start Voice Loop ไม่มี
+            # การเรียก tree.sync() ซ้ำในรอบนี้อีก
 
-                log.info(
-                    "Command definitions unchanged - skipping tree.sync() "
-                    "for guild %s to avoid unnecessary Discord API calls",
-                    GUILD_ID
-                )
+            await self.close()
+
+            return
+
+        # ---------------------------------------------
+        # โหมดทำงานปกติ (COMMAND_SYNC != "1")
+        # ---------------------------------------------
+        # ไม่เรียก tree.sync() เลยในโหมดนี้ - คำสั่งที่เคย Sync ไว้จาก
+        # รอบ COMMAND_SYNC=1 ก่อนหน้ายังคงอยู่ฝั่ง Discord ตามปกติ ไม่ต้อง
+        # Sync ซ้ำทุกครั้งที่ Restart
+        # ---------------------------------------------
+
+        log.info(
+            "COMMAND_SYNC=0 (ปกติ) - ข้าม tree.sync() เพื่อไม่เรียก "
+            "Discord API โดยไม่จำเป็นตอน Restart"
+        )
 
         # ---------------------------------------------
         # Voice Reconnect Loop
@@ -2729,16 +2689,52 @@ def main():
     # SystemExit(1) ปล่อยให้ Render เป็นผู้ตัดสินใจ Restart ตามปกติ
     # ---------------------------------------------
 
+    command_sync_mode = os.getenv(
+        "COMMAND_SYNC",
+        "0"
+    ).strip() == "1"
+
     try:
 
-        log.info(
-            "Starting Discord Bot..."
-        )
+        if command_sync_mode:
+
+            log.info(
+                "COMMAND_SYNC=1 - กำลังเข้าสู่โหมด Sync Slash Commands "
+                "ครั้งเดียว (จะปิด Bot ทันทีหลัง Sync เสร็จ ไม่ทำงานเป็น "
+                "บอทตามปกติในรอบนี้)"
+            )
+
+        else:
+
+            log.info(
+                "Starting Discord Bot..."
+            )
 
         bot.run(
             TOKEN,
             log_handler=None
         )
+
+        if command_sync_mode:
+
+            if getattr(bot, "_command_sync_ok", False):
+
+                log.info(
+                    "Sync เสร็จสมบูรณ์ - กรุณาตั้งค่า COMMAND_SYNC=0 กลับ "
+                    "แล้ว Deploy/Restart อีกครั้งเพื่อให้บอทกลับมาทำงาน "
+                    "ตามปกติ"
+                )
+
+                raise SystemExit(0)
+
+            else:
+
+                log.error(
+                    "Sync ไม่สำเร็จ (ดู Log ด้านบนสำหรับสาเหตุ) - จะไม่ "
+                    "Retry เอง กรุณาตรวจสอบแล้วลองใหม่"
+                )
+
+                raise SystemExit(1)
 
         log.info(
             "Bot has shut down cleanly."
