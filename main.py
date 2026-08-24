@@ -883,6 +883,14 @@ class LevelingXBot(
         )
 
         # ---------------------------------------------
+        # Login/Connect สำเร็จ -> เคลียร์ Cooldown จาก 429 ครั้งก่อน (ถ้ามี)
+        # ป้องกันไม่ให้ Cooldown เก่าค้างอยู่และทำให้ Startup รอบถัดไป
+        # (เช่น redeploy ปกติ) ต้องรอโดยไม่จำเป็น ทั้งที่ Login ผ่านแล้ว
+        # ---------------------------------------------
+
+        clear_login_cooldown()
+
+        # ---------------------------------------------
         # Status
         # ---------------------------------------------
 
@@ -2545,21 +2553,127 @@ async def on_guild_join(
 
 
 # =========================================================
+# LOGIN RATE-LIMIT COOLDOWN (บันทึกลง data.json - รอดข้าม Restart)
+# =========================================================
+# ถ้าโดน Discord Global Rate Limit (429) ตอน Login/Connect จะบันทึก
+# เวลาที่ "ห้าม Login ก่อนถึง" ไว้ในนี้ เพื่อให้ถึงแม้ Render จะสั่ง
+# Restart Process ใหม่ทันที (เช่น Process ก่อนหน้า Exit เพราะโดน 429)
+# Process รอบใหม่ก็จะยังจำได้ว่าต้องรอเวลาต่อจากเดิม ไม่ใช่พยายาม
+# Login ทันทีซ้ำอีกครั้งจนซ้ำเติม Rate Limit ให้หนักขึ้นไปอีก
+# =========================================================
+
+RATE_LIMIT_COOLDOWN_KEY = "_login_rate_limit_until"
+
+
+def get_login_cooldown_remaining():
+    """คืนจำนวนวินาทีที่ยังต้องรอก่อน Login ได้ (0 ถ้าไม่ต้องรอแล้ว)"""
+
+    until = data.get(
+        RATE_LIMIT_COOLDOWN_KEY
+    )
+
+    if not until:
+
+        return 0
+
+    try:
+
+        remaining = float(until) - time.time()
+
+    except (TypeError, ValueError):
+
+        return 0
+
+    return max(0.0, remaining)
+
+
+def set_login_cooldown(retry_after_seconds):
+    """บันทึกเวลาที่ห้าม Login ก่อนถึง ลง data.json (กันข้าม Restart)"""
+
+    data[RATE_LIMIT_COOLDOWN_KEY] = time.time() + float(retry_after_seconds)
+
+    save_data(data)
+
+
+def clear_login_cooldown():
+    """เคลียร์ Cooldown เก่า (เรียกหลัง Login/Connect สำเร็จใน on_ready)"""
+
+    if RATE_LIMIT_COOLDOWN_KEY in data:
+
+        del data[RATE_LIMIT_COOLDOWN_KEY]
+
+        save_data(data)
+
+
+def extract_retry_after(error):
+    """ดึงค่า retry_after (วินาที) จาก discord.HTTPException ถ้ามี"""
+
+    retry_after = getattr(
+        error,
+        "retry_after",
+        None
+    )
+
+    if retry_after:
+
+        try:
+
+            return float(retry_after)
+
+        except (TypeError, ValueError):
+
+            pass
+
+    response = getattr(
+        error,
+        "response",
+        None
+    )
+
+    header_value = None
+
+    if response is not None and getattr(
+        response,
+        "headers",
+        None
+    ):
+
+        header_value = response.headers.get(
+            "Retry-After"
+        )
+
+    if header_value:
+
+        try:
+
+            return float(header_value)
+
+        except (TypeError, ValueError):
+
+            return None
+
+    return None
+
+
+# =========================================================
 # MAIN
 # =========================================================
+
 
 def main():
 
     # ---------------------------------------------
     # ตรวจสอบ Environment Variables ก่อนเริ่มทำงานใด ๆ
-    # ถ้าค่าที่จำเป็น (เช่น DISCORD_TOKEN, GUILD_ID) ขาดหรือผิด
-    # จะหยุดโปรแกรมทันทีพร้อม log สาเหตุ ไม่ปล่อยให้บอทรันแบบพัง
     # ---------------------------------------------
 
     validate_startup_env()
 
     # ---------------------------------------------
-    # Start Web Server
+    # Start Web Server (เริ่มก่อนเสมอ แยก Thread)
+    # ---------------------------------------------
+    # /health ต้องตอบได้ทันที ไม่ว่า Discord Login จะสำเร็จ ล่าช้าจาก
+    # การรอ Cooldown หรือ Fail ก็ตาม เพื่อไม่ให้ Render มองว่า Service
+    # ค้าง/ไม่ Healthy ระหว่างที่บอทกำลังรอหรือพยายามเชื่อมต่อ Discord
     # ---------------------------------------------
 
     web_thread = threading.Thread(
@@ -2570,221 +2684,140 @@ def main():
     web_thread.start()
 
     # ---------------------------------------------
-    # Start Discord Bot
+    # เคารพ Cooldown จากการโดน 429 ครั้งก่อน (ถ้ามี) ก่อน Login
     # ---------------------------------------------
-    # หลุดการเชื่อมต่อ (network, Discord API ล่ม ฯลฯ) -> reconnect อัตโนมัติ
-    # แต่ถ้า Token ผิด หรือ Privileged Intents ไม่ได้เปิดใน Developer Portal
-    # ถือเป็นปัญหาการตั้งค่า ไม่ใช่ปัญหาเครือข่ายชั่วคราว จึงไม่วน retry
-    # ทุก 10 วินาทีแบบไม่มีที่สิ้นสุด ให้หยุดและ log สาเหตุให้ชัดเจนแทน
-    #
-    # ถ้าเจอ HTTP 429 (Too Many Requests) จะรอตามเวลาที่ Discord กำหนด
-    # (retry_after จาก header ของ Discord เอง) ก่อนค่อย reconnect ใหม่
-    # แทนที่จะ retry รัว ๆ ทุก 10 วินาทีเหมือนเดิม ซึ่งจะยิ่งซ้ำเติมปัญหา
-    # Rate Limit ให้หนักขึ้นไปอีก (ตามที่เห็นใน Log: "You are being
-    # blocked from accessing our API temporarily due to exceeding
-    # global rate limits")
-    #
-    # ส่วน Error อื่น ๆ ที่ไม่ใช่ 429 จะใช้ Exponential Backoff (เพิ่มเวลา
-    # รอเป็นเท่าตัวทุกครั้งที่ล้มเหลวติดกัน จนถึงเพดานสูงสุด) พร้อม Jitter
-    # เล็กน้อยเพื่อป้องกันการยิง Request พร้อมกันเป๊ะ ๆ ทุกครั้ง และจะ
-    # รีเซ็ตตัวนับกลับเป็นค่าเริ่มต้นเมื่อบอทสามารถรันได้เสถียรระยะหนึ่ง
-    # แล้วจึงค่อยหลุดในภายหลัง (ไม่ใช่ล้มเหลวติด ๆ กันทันที) เพื่อป้องกัน
-    # ไม่ให้เวลารอค้างอยู่ที่ค่าสูงสุดตลอดไปโดยไม่จำเป็น
+    # ค่านี้ถูกบันทึกไว้ใน data.json (ดูฟังก์ชัน set_login_cooldown)
+    # เพื่อให้ "รอด" ข้าม Restart ของ Render - ถึงแม้ Render จะสั่ง
+    # Restart Process ใหม่ทันทีหลังจาก Process ก่อนหน้าโดน 429 และ
+    # หยุดตัวเอง โค้ดในรอบใหม่นี้ก็จะยังคงเช็คและรอเวลาที่เหลือต่อ
+    # ไม่ใช่พยายาม Login ทันทีซ้ำอีกครั้งจนโดน Rate Limit หนักขึ้นไปอีก
     # ---------------------------------------------
 
-    BASE_BACKOFF_SECONDS = 10
-    MAX_BACKOFF_SECONDS = 300
-    STABLE_RUN_THRESHOLD_SECONDS = 120
+    remaining = get_login_cooldown_remaining()
 
-    consecutive_failures = 0
+    if remaining > 0:
 
-    while True:
+        log.error(
+            "ยังอยู่ในช่วง Cooldown จากการโดน Discord Global Rate Limit "
+            "(429) ครั้งก่อน - จะรออีก %.1f วินาที ก่อนพยายาม Login "
+            "(ค่านี้ถูกบันทึกไว้ข้าม Restart เพื่อไม่ให้ยิง Discord API "
+            "ซ้ำก่อนเวลาที่ Discord กำหนด)",
+            remaining
+        )
 
-        run_started_at = time.time()
+        time.sleep(remaining)
 
-        try:
+    # ---------------------------------------------
+    # Start Discord Bot - เรียก bot.run() เพียงครั้งเดียว
+    # ---------------------------------------------
+    # ไม่มี while True + retry loop ที่ทำเอง: Render เป็นผู้จัดการ
+    # การ Restart Service อยู่แล้ว (ทั้งกรณีปิดปกติและ Error) ส่วนการ
+    # หลุดของ Gateway ระหว่างที่บอทกำลังทำงานอยู่ (network สะดุด,
+    # Discord ล่มชั่วคราว ฯลฯ) discord.py จะจัดการ Reconnect ให้เอง
+    # โดยอัตโนมัติภายใน bot.run() (พฤติกรรม Default อยู่แล้ว) โดยไม่
+    # ต้องเขียน Loop restart ซ้อนขึ้นมาอีกชั้น ซึ่งจะยิ่งเสี่ยงยิง
+    # Discord API ซ้ำเกินจำเป็นเวลาเกิดปัญหาต่อเนื่อง
+    #
+    # กรณีที่ควรหยุด Process ทันที (ไม่ Retry เอง) เพราะเป็นปัญหาที่
+    # Retry ไปก็ไม่มีทางหาย หรือเป็นปัญหาระดับ Rate Limit ที่ต้องรอ
+    # เวลาจริง ๆ ก่อน:
+    #   - Token ผิด (LoginFailure)
+    #   - ขาด Privileged Intents ที่ตั้งค่าใน Developer Portal
+    #   - โดน 429 Global Rate Limit ตอน Login/Connect
+    #   - Error อื่น ๆ ที่ไม่คาดคิดตอน Startup/Runtime
+    # ทุกกรณีข้างต้นจะ Log สาเหตุให้ชัดเจนแล้วจบ Process ด้วย
+    # SystemExit(1) ปล่อยให้ Render เป็นผู้ตัดสินใจ Restart ตามปกติ
+    # ---------------------------------------------
 
-            log.info(
-                "Starting Discord Bot..."
-            )
+    try:
 
-            bot.run(
-                TOKEN,
-                log_handler=None
-            )
+        log.info(
+            "Starting Discord Bot..."
+        )
 
-            # bot.run() คืนค่าปกติเมื่อบอทถูกปิดแบบตั้งใจ (เช่น bot.close())
-            # ไม่ควร restart วนอีก
-            log.info(
-                "Bot has shut down cleanly."
-            )
+        bot.run(
+            TOKEN,
+            log_handler=None
+        )
 
-            break
+        log.info(
+            "Bot has shut down cleanly."
+        )
 
-        except discord.LoginFailure:
+    except discord.LoginFailure:
+
+        log.error(
+            "DISCORD_TOKEN ไม่ถูกต้อง กรุณาตรวจสอบค่าใน Environment "
+            "Variables ให้ถูกต้อง (จะไม่ Retry เพราะปัญหานี้ Retry ไป "
+            "ก็ไม่มีทางหาย)"
+        )
+
+        raise SystemExit(1)
+
+    except discord.PrivilegedIntentsRequired:
+
+        log.error(
+            "บอทต้องเปิดใช้งาน Privileged Intents (Server Members Intent) "
+            "ในหน้า Discord Developer Portal ก่อนถึงจะรันได้ (จะไม่ Retry "
+            "เพราะปัญหานี้ Retry ไปก็ไม่มีทางหาย)"
+        )
+
+        raise SystemExit(1)
+
+    except discord.HTTPException as error:
+
+        status = getattr(
+            error,
+            "status",
+            None
+        )
+
+        if status == 429:
+
+            retry_after = extract_retry_after(error)
+
+            if not retry_after or retry_after <= 0:
+
+                retry_after = 60.0
+
+            set_login_cooldown(retry_after)
 
             log.error(
-                "DISCORD_TOKEN ไม่ถูกต้อง กรุณาตรวจสอบค่าใน Environment "
-                "Variables ให้ถูกต้อง (บอทจะไม่พยายามเชื่อมต่อใหม่)"
+                "โดน Discord API 429 Too Many Requests (Global Rate Limit) "
+                "ตอน Login/Connect - บันทึก Cooldown %.1f วินาที ลง "
+                "data.json แล้วหยุด Process อย่างปลอดภัย (จะไม่พยายาม "
+                "Login ซ้ำใน Process นี้อีก) หาก Render Restart Service "
+                "ให้ใหม่ รอบถัดไปจะเช็ค Cooldown นี้ก่อนเสมอ และจะยังไม่ "
+                "Login จนกว่าจะครบเวลาที่ Discord กำหนด - โค้ดนี้ป้องกัน "
+                "ได้แค่ไม่ให้ยิงซ้ำเพิ่ม แต่ลบ Rate Limit ที่ Discord "
+                "บังคับอยู่ไม่ได้ ต้องรอให้ครบเวลาก่อนถึงจะ Login ได้จริง",
+                retry_after
             )
 
-            break
-
-        except discord.PrivilegedIntentsRequired:
-
-            log.error(
-                "บอทต้องเปิดใช้งาน Privileged Intents (เช่น Server Members "
-                "Intent) ในหน้า Discord Developer Portal ก่อนถึงจะรันได้ "
-                "(บอทจะไม่พยายามเชื่อมต่อใหม่)"
-            )
-
-            break
-
-        except KeyboardInterrupt:
-
-            break
-
-        except discord.HTTPException as error:
-
-            ran_for = time.time() - run_started_at
-
-            if ran_for > STABLE_RUN_THRESHOLD_SECONDS:
-
-                consecutive_failures = 0
-
-            if getattr(error, "status", None) == 429:
-
-                # -----------------------------------------
-                # โดน Discord Rate Limit (429) โดยตรง
-                # ให้ใช้เวลาที่ Discord กำหนดมาให้ (retry_after จาก
-                # HTTP Header "Retry-After") แทนการเดาเอง ถ้าหาค่านี้
-                # ไม่ได้จริง ๆ ค่อย fallback ไปใช้ Exponential Backoff
-                # -----------------------------------------
-
-                retry_after = getattr(
-                    error,
-                    "retry_after",
-                    None
-                )
-
-                if retry_after is None:
-
-                    response = getattr(
-                        error,
-                        "response",
-                        None
-                    )
-
-                    header_value = None
-
-                    if response is not None and getattr(
-                        response,
-                        "headers",
-                        None
-                    ):
-
-                        header_value = response.headers.get(
-                            "Retry-After"
-                        )
-
-                    if header_value:
-
-                        try:
-
-                            retry_after = float(
-                                header_value
-                            )
-
-                        except (
-                            TypeError,
-                            ValueError
-                        ):
-
-                            retry_after = None
-
-                if not retry_after or retry_after <= 0:
-
-                    retry_after = min(
-                        BASE_BACKOFF_SECONDS * (2 ** consecutive_failures),
-                        MAX_BACKOFF_SECONDS
-                    )
-
-                # เผื่อเวลาเพิ่มเล็กน้อยกันกรณี Clock/Network คลาดเคลื่อน
-                wait_seconds = retry_after + random.uniform(1, 3)
-
-                consecutive_failures += 1
-
-                log.error(
-                    "โดน Discord API 429 Too Many Requests - รอ %.1f วินาที "
-                    "ตามที่ Discord กำหนด (retry_after) ก่อน reconnect ใหม่ "
-                    "(ครั้งที่ล้มเหลวติดกัน: %d)",
-                    wait_seconds,
-                    consecutive_failures
-                )
-
-                time.sleep(
-                    wait_seconds
-                )
-
-            else:
-
-                # -----------------------------------------
-                # HTTP Error อื่นที่ไม่ใช่ 429 (เช่น 500, 502, 503)
-                # ใช้ Exponential Backoff เช่นกัน ไม่ reconnect รัว ๆ
-                # -----------------------------------------
-
-                wait_seconds = min(
-                    BASE_BACKOFF_SECONDS * (2 ** consecutive_failures),
-                    MAX_BACKOFF_SECONDS
-                ) + random.uniform(0, 2)
-
-                consecutive_failures += 1
-
-                log.exception(
-                    "Discord HTTPException (status: %s) - รอ %.1f วินาที "
-                    "ก่อนลองเชื่อมต่อใหม่ (ครั้งที่ล้มเหลวติดกัน: %d)",
-                    getattr(error, "status", "unknown"),
-                    wait_seconds,
-                    consecutive_failures
-                )
-
-                time.sleep(
-                    wait_seconds
-                )
-
-        except Exception:
-
-            # -----------------------------------------
-            # Error อื่น ๆ ที่ไม่คาดคิด (network ล่ม, gateway หลุดแรง ฯลฯ)
-            # ใช้ Exponential Backoff แทนการรอคงที่ 10 วินาทีทุกครั้ง
-            # เพื่อไม่ให้ยิง Discord API ถี่เกินไปจนซ้ำเติม Rate Limit
-            # -----------------------------------------
-
-            ran_for = time.time() - run_started_at
-
-            if ran_for > STABLE_RUN_THRESHOLD_SECONDS:
-
-                # บอทรันได้เสถียรมาสักพักก่อนจะล้มเหลว ถือว่าไม่ใช่
-                # ปัญหาวนซ้ำ ๆ ทันที จึงรีเซ็ตตัวนับ Backoff กลับ
-                consecutive_failures = 0
-
-            wait_seconds = min(
-                BASE_BACKOFF_SECONDS * (2 ** consecutive_failures),
-                MAX_BACKOFF_SECONDS
-            ) + random.uniform(0, 2)
-
-            consecutive_failures += 1
+        else:
 
             log.exception(
-                "Bot crashed unexpectedly. Restarting in %.1f seconds "
-                "(consecutive failures: %d)...",
-                wait_seconds,
-                consecutive_failures
+                "Discord HTTPException (status: %s) ตอน Startup - หยุด "
+                "Process อย่างปลอดภัย ให้ Render เป็นผู้จัดการ Restart",
+                status
             )
 
-            time.sleep(
-                wait_seconds
-            )
+        raise SystemExit(1)
+
+    except KeyboardInterrupt:
+
+        pass
+
+    except Exception:
+
+        log.exception(
+            "Bot crashed unexpectedly ตอน Startup/Runtime - หยุด Process "
+            "อย่างปลอดภัย ให้ Render เป็นผู้จัดการ Restart เอง (ไม่ทำ "
+            "Retry Loop เองในโค้ดเพื่อป้องกันการยิง Discord API ซ้ำถี่ "
+            "เกินความจำเป็น)"
+        )
+
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
