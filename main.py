@@ -717,6 +717,13 @@ class LevelingXBot(
 
         self.bot_start_time = time.time()
 
+        # ใช้ตรวจว่าเคยตั้ง Presence ไปแล้วหรือยัง (ดู on_ready) - ป้องกัน
+        # การเรียก change_presence() ซ้ำโดยไม่จำเป็นทุกครั้งที่ on_ready
+        # ถูกเรียกซ้ำจาก Gateway Reconnect (on_ready อาจถูกเรียกมากกว่า
+        # 1 ครั้งต่อการรัน Process 1 ครั้ง)
+
+        self._presence_initialized = False
+
     async def setup_hook(
         self
     ):
@@ -843,23 +850,24 @@ class LevelingXBot(
         )
 
         # ---------------------------------------------
-        # Login/Connect สำเร็จ -> เคลียร์ Cooldown จาก 429 ครั้งก่อน (ถ้ามี)
-        # ป้องกันไม่ให้ Cooldown เก่าค้างอยู่และทำให้ Startup รอบถัดไป
-        # (เช่น redeploy ปกติ) ต้องรอโดยไม่จำเป็น ทั้งที่ Login ผ่านแล้ว
+        # Status (ตั้งแค่ครั้งแรกเท่านั้น)
+        # ---------------------------------------------
+        # on_ready อาจถูกเรียกซ้ำได้เมื่อ Gateway ทำ Reconnect - ไม่ต้อง
+        # เรียก change_presence() ซ้ำทุกครั้ง เพราะ discord.py จะส่งค่า
+        # Presence ล่าสุดที่ตั้งไว้กลับไปเองโดยอัตโนมัติเมื่อ Reconnect
+        # อยู่แล้ว การเรียกซ้ำจึงเป็นแค่ Request ที่ไม่จำเป็นเพิ่มขึ้นมา
         # ---------------------------------------------
 
-        clear_login_cooldown()
+        if not self._presence_initialized:
 
-        # ---------------------------------------------
-        # Status
-        # ---------------------------------------------
-
-        await self.change_presence(
-            status=discord.Status.online,
-            activity=discord.Game(
-                "Developer : LevelingX"
+            await self.change_presence(
+                status=discord.Status.online,
+                activity=discord.Game(
+                    "Developer : LevelingX"
+                )
             )
-        )
+
+            self._presence_initialized = True
 
         # ---------------------------------------------
         # ป้องกัน Bot อยู่ใน Guild อื่นที่ไม่ได้รับอนุญาต
@@ -2513,109 +2521,6 @@ async def on_guild_join(
 
 
 # =========================================================
-# LOGIN RATE-LIMIT COOLDOWN (บันทึกลง data.json - รอดข้าม Restart)
-# =========================================================
-# ถ้าโดน Discord Global Rate Limit (429) ตอน Login/Connect จะบันทึก
-# เวลาที่ "ห้าม Login ก่อนถึง" ไว้ในนี้ เพื่อให้ถึงแม้ Render จะสั่ง
-# Restart Process ใหม่ทันที (เช่น Process ก่อนหน้า Exit เพราะโดน 429)
-# Process รอบใหม่ก็จะยังจำได้ว่าต้องรอเวลาต่อจากเดิม ไม่ใช่พยายาม
-# Login ทันทีซ้ำอีกครั้งจนซ้ำเติม Rate Limit ให้หนักขึ้นไปอีก
-# =========================================================
-
-RATE_LIMIT_COOLDOWN_KEY = "_login_rate_limit_until"
-
-
-def get_login_cooldown_remaining():
-    """คืนจำนวนวินาทีที่ยังต้องรอก่อน Login ได้ (0 ถ้าไม่ต้องรอแล้ว)"""
-
-    until = data.get(
-        RATE_LIMIT_COOLDOWN_KEY
-    )
-
-    if not until:
-
-        return 0
-
-    try:
-
-        remaining = float(until) - time.time()
-
-    except (TypeError, ValueError):
-
-        return 0
-
-    return max(0.0, remaining)
-
-
-def set_login_cooldown(retry_after_seconds):
-    """บันทึกเวลาที่ห้าม Login ก่อนถึง ลง data.json (กันข้าม Restart)"""
-
-    data[RATE_LIMIT_COOLDOWN_KEY] = time.time() + float(retry_after_seconds)
-
-    save_data(data)
-
-
-def clear_login_cooldown():
-    """เคลียร์ Cooldown เก่า (เรียกหลัง Login/Connect สำเร็จใน on_ready)"""
-
-    if RATE_LIMIT_COOLDOWN_KEY in data:
-
-        del data[RATE_LIMIT_COOLDOWN_KEY]
-
-        save_data(data)
-
-
-def extract_retry_after(error):
-    """ดึงค่า retry_after (วินาที) จาก discord.HTTPException ถ้ามี"""
-
-    retry_after = getattr(
-        error,
-        "retry_after",
-        None
-    )
-
-    if retry_after:
-
-        try:
-
-            return float(retry_after)
-
-        except (TypeError, ValueError):
-
-            pass
-
-    response = getattr(
-        error,
-        "response",
-        None
-    )
-
-    header_value = None
-
-    if response is not None and getattr(
-        response,
-        "headers",
-        None
-    ):
-
-        header_value = response.headers.get(
-            "Retry-After"
-        )
-
-    if header_value:
-
-        try:
-
-            return float(header_value)
-
-        except (TypeError, ValueError):
-
-            return None
-
-    return None
-
-
-# =========================================================
 # MAIN
 # =========================================================
 
@@ -2644,49 +2549,18 @@ def main():
     web_thread.start()
 
     # ---------------------------------------------
-    # เคารพ Cooldown จากการโดน 429 ครั้งก่อน (ถ้ามี) ก่อน Login
-    # ---------------------------------------------
-    # ค่านี้ถูกบันทึกไว้ใน data.json (ดูฟังก์ชัน set_login_cooldown)
-    # เพื่อให้ "รอด" ข้าม Restart ของ Render - ถึงแม้ Render จะสั่ง
-    # Restart Process ใหม่ทันทีหลังจาก Process ก่อนหน้าโดน 429 และ
-    # หยุดตัวเอง โค้ดในรอบใหม่นี้ก็จะยังคงเช็คและรอเวลาที่เหลือต่อ
-    # ไม่ใช่พยายาม Login ทันทีซ้ำอีกครั้งจนโดน Rate Limit หนักขึ้นไปอีก
-    # ---------------------------------------------
-
-    remaining = get_login_cooldown_remaining()
-
-    if remaining > 0:
-
-        log.error(
-            "ยังอยู่ในช่วง Cooldown จากการโดน Discord Global Rate Limit "
-            "(429) ครั้งก่อน - จะรออีก %.1f วินาที ก่อนพยายาม Login "
-            "(ค่านี้ถูกบันทึกไว้ข้าม Restart เพื่อไม่ให้ยิง Discord API "
-            "ซ้ำก่อนเวลาที่ Discord กำหนด)",
-            remaining
-        )
-
-        time.sleep(remaining)
-
-    # ---------------------------------------------
     # Start Discord Bot - เรียก bot.run() เพียงครั้งเดียว
     # ---------------------------------------------
-    # ไม่มี while True + retry loop ที่ทำเอง: Render เป็นผู้จัดการ
-    # การ Restart Service อยู่แล้ว (ทั้งกรณีปิดปกติและ Error) ส่วนการ
-    # หลุดของ Gateway ระหว่างที่บอทกำลังทำงานอยู่ (network สะดุด,
-    # Discord ล่มชั่วคราว ฯลฯ) discord.py จะจัดการ Reconnect ให้เอง
-    # โดยอัตโนมัติภายใน bot.run() (พฤติกรรม Default อยู่แล้ว) โดยไม่
-    # ต้องเขียน Loop restart ซ้อนขึ้นมาอีกชั้น ซึ่งจะยิ่งเสี่ยงยิง
-    # Discord API ซ้ำเกินจำเป็นเวลาเกิดปัญหาต่อเนื่อง
-    #
-    # กรณีที่ควรหยุด Process ทันที (ไม่ Retry เอง) เพราะเป็นปัญหาที่
-    # Retry ไปก็ไม่มีทางหาย หรือเป็นปัญหาระดับ Rate Limit ที่ต้องรอ
-    # เวลาจริง ๆ ก่อน:
-    #   - Token ผิด (LoginFailure)
-    #   - ขาด Privileged Intents ที่ตั้งค่าใน Developer Portal
-    #   - โดน 429 Global Rate Limit ตอน Login/Connect
-    #   - Error อื่น ๆ ที่ไม่คาดคิดตอน Startup/Runtime
-    # ทุกกรณีข้างต้นจะ Log สาเหตุให้ชัดเจนแล้วจบ Process ด้วย
-    # SystemExit(1) ปล่อยให้ Render เป็นผู้ตัดสินใจ Restart ตามปกติ
+    # ไม่มี while True + retry loop ที่ทำเอง ไม่มี cooldown ที่บันทึกลง
+    # data.json ไม่มีการพยายาม Login ซ้ำเองในกรณีใด ๆ ทั้งสิ้น:
+    #   - Render เป็นผู้จัดการ Restart Service เอง (ทั้งกรณีปิดปกติและ
+    #     Error) เราจึงไม่เขียน Logic มาควบคุมการ Restart ของ Process
+    #   - Gateway หลุดชั่วคราวระหว่างบอทกำลังทำงานอยู่ (network สะดุด,
+    #     Discord ล่มสั้น ๆ ฯลฯ) discord.py จัดการ Reconnect ให้เองโดย
+    #     อัตโนมัติภายใน bot.run() (พฤติกรรม Default อยู่แล้ว) - จุดนี้
+    #     คนละเรื่องกับ HTTP 429 ตอน Login ด้านล่าง จึงไม่เขียน Logic
+    #     ใด ๆ มาแทรกแซงส่วนนี้เลย ปล่อยให้เป็นหน้าที่ของ discord.py
+    #     ทั้งหมด
     # ---------------------------------------------
 
     command_sync_mode = os.getenv(
@@ -2742,20 +2616,27 @@ def main():
 
     except discord.LoginFailure:
 
+        # DISCORD_TOKEN ผิด - Retry/Restart ไปเท่าไหร่ก็ไม่มีทางสำเร็จ
+        # จนกว่าจะแก้ Token ให้ถูกต้อง จึง Log ให้ชัดแล้วจบ Process
+        # เพื่อให้ผู้ดูแลเห็น Error ทันทีและไปแก้ Environment Variable
+
         log.error(
             "DISCORD_TOKEN ไม่ถูกต้อง กรุณาตรวจสอบค่าใน Environment "
-            "Variables ให้ถูกต้อง (จะไม่ Retry เพราะปัญหานี้ Retry ไป "
-            "ก็ไม่มีทางหาย)"
+            "Variables ให้ถูกต้อง (ปัญหานี้ Retry ไปก็ไม่มีทางหาย - ไม่ "
+            "ทำการ Retry ใด ๆ)"
         )
 
         raise SystemExit(1)
 
     except discord.PrivilegedIntentsRequired:
 
+        # ขาด Privileged Intent ที่ตั้งค่าใน Discord Developer Portal -
+        # เป็นปัญหาการตั้งค่า ไม่ใช่ปัญหาที่ Retry แล้วจะหายไปเอง
+
         log.error(
             "บอทต้องเปิดใช้งาน Privileged Intents (Server Members Intent) "
-            "ในหน้า Discord Developer Portal ก่อนถึงจะรันได้ (จะไม่ Retry "
-            "เพราะปัญหานี้ Retry ไปก็ไม่มีทางหาย)"
+            "ในหน้า Discord Developer Portal ก่อนถึงจะรันได้ (ปัญหานี้ "
+            "Retry ไปก็ไม่มีทางหาย - ไม่ทำการ Retry ใด ๆ)"
         )
 
         raise SystemExit(1)
@@ -2770,35 +2651,77 @@ def main():
 
         if status == 429:
 
-            retry_after = extract_retry_after(error)
+            # ---------------------------------------------
+            # Discord Global Rate Limit (429) ตอน Login/Connect
+            # ---------------------------------------------
+            # นี่คือกรณีเดียวที่ตั้งใจ "ไม่ raise SystemExit" หลังจาก Log
+            # เพราะถ้าปล่อยให้ Process จบแล้วให้ Render Restart ทันที
+            # (ไม่ว่าจะเร็วแค่ไหน) Process ใหม่ก็จะพยายาม Login ซ้ำก่อน
+            # ที่ Rate Limit เดิมจะหมดเวลา ยิ่งทำให้ Discord บล็อกนานขึ้น
+            # ไปอีก (นี่คือสาเหตุหลักของปัญหาเดิม) จึงให้ Process นี้
+            # "ค้างอยู่เฉย ๆ" ต่อไป (ไม่ Login ซ้ำ ไม่ Retry ไม่มี Loop
+            # ใด ๆ) โดย Web Server (/health) ยังคงตอบสนองตามปกติ ทำให้
+            # Render มองว่า Service ยัง Healthy และไม่ Auto-Restart ให้
+            #
+            # ผลที่ตามมา: บอทจะไม่ฟื้นตัวเองอัตโนมัติหลังจากนี้ - ต้องรอ
+            # ให้ retry_after ที่ Discord กำหนดผ่านไปก่อน แล้ว "Manual
+            # Restart" Service บน Render Dashboard เองอีกครั้ง
+            # ---------------------------------------------
 
-            if not retry_after or retry_after <= 0:
+            retry_after = getattr(
+                error,
+                "retry_after",
+                None
+            )
 
-                retry_after = 60.0
+            if retry_after:
 
-            set_login_cooldown(retry_after)
+                log.error(
+                    "โดน Discord API 429 Too Many Requests (Global Rate "
+                    "Limit) ตอน Login/Connect - Discord กำหนดให้รออีก "
+                    "%.1f วินาที (~%.1f นาที) ก่อน Login ใหม่ได้ "
+                    "จะไม่พยายาม Login ซ้ำเองในนี้และจะไม่จบ Process "
+                    "เพื่อไม่ให้ Render Restart แล้วยิง Login ซ้ำก่อนครบ "
+                    "เวลา - Web Server (/health) ยังทำงานอยู่ตามปกติ "
+                    "แต่ Discord Bot จะไม่เชื่อมต่อจนกว่าจะมีคน Manual "
+                    "Restart Service นี้เองหลังรอครบเวลาแล้ว",
+                    retry_after,
+                    retry_after / 60
+                )
+
+            else:
+
+                log.error(
+                    "โดน Discord API 429 Too Many Requests (Global Rate "
+                    "Limit) ตอน Login/Connect (ไม่มีค่า retry_after ระบุ "
+                    "มาด้วย) - จะไม่พยายาม Login ซ้ำเองในนี้และจะไม่จบ "
+                    "Process เพื่อไม่ให้ Render Restart แล้วยิง Login ซ้ำ "
+                    "ทันที - Web Server (/health) ยังทำงานอยู่ตามปกติ "
+                    "แต่ Discord Bot จะไม่เชื่อมต่อจนกว่าจะมีคน Manual "
+                    "Restart Service นี้เอง (แนะนำให้รออย่างน้อย "
+                    "10-15 นาทีก่อนลอง Restart)"
+                )
 
             log.error(
-                "โดน Discord API 429 Too Many Requests (Global Rate Limit) "
-                "ตอน Login/Connect - บันทึก Cooldown %.1f วินาที ลง "
-                "data.json แล้วหยุด Process อย่างปลอดภัย (จะไม่พยายาม "
-                "Login ซ้ำใน Process นี้อีก) หาก Render Restart Service "
-                "ให้ใหม่ รอบถัดไปจะเช็ค Cooldown นี้ก่อนเสมอ และจะยังไม่ "
-                "Login จนกว่าจะครบเวลาที่ Discord กำหนด - โค้ดนี้ป้องกัน "
-                "ได้แค่ไม่ให้ยิงซ้ำเพิ่ม แต่ลบ Rate Limit ที่ Discord "
-                "บังคับอยู่ไม่ได้ ต้องรอให้ครบเวลาก่อนถึงจะ Login ได้จริง",
-                retry_after
+                "หมายเหตุ: โค้ดนี้ป้องกันได้แค่ไม่ให้ยิง Login ซ้ำเพิ่ม "
+                "เติม Rate Limit ให้หนักขึ้น แต่ไม่สามารถลบ Rate Limit "
+                "ที่ Discord บังคับอยู่ในขณะนี้ได้"
             )
+
+            # ค้างรอเฉย ๆ ไม่ Exit ไม่ Retry - ให้คนตัดสินใจ Restart เอง
+            # ทีหลังแทน (ไม่ใช่ Retry Loop เพราะไม่มีการเรียก bot.run()
+            # หรือพยายาม Login ซ้ำใด ๆ ในนี้อีกเลย)
+
+            threading.Event().wait()
 
         else:
 
             log.exception(
-                "Discord HTTPException (status: %s) ตอน Startup - หยุด "
-                "Process อย่างปลอดภัย ให้ Render เป็นผู้จัดการ Restart",
+                "Discord HTTPException (status: %s) ตอน Startup",
                 status
             )
 
-        raise SystemExit(1)
+            raise SystemExit(1)
 
     except KeyboardInterrupt:
 
@@ -2807,10 +2730,7 @@ def main():
     except Exception:
 
         log.exception(
-            "Bot crashed unexpectedly ตอน Startup/Runtime - หยุด Process "
-            "อย่างปลอดภัย ให้ Render เป็นผู้จัดการ Restart เอง (ไม่ทำ "
-            "Retry Loop เองในโค้ดเพื่อป้องกันการยิง Discord API ซ้ำถี่ "
-            "เกินความจำเป็น)"
+            "Bot crashed unexpectedly ตอน Startup/Runtime"
         )
 
         raise SystemExit(1)
@@ -2819,3 +2739,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
