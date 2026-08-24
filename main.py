@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import random
+import hashlib
 import asyncio
 import logging
 import platform
@@ -64,6 +66,30 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("LevelingXBot")
+
+
+# =========================================================
+# SUPPRESS BENIGN "PRIVILEGED MESSAGE CONTENT INTENT" WARNING
+# =========================================================
+# บอทนี้ใช้ระบบคำสั่งแบบ Slash Command (app_commands) ทั้งหมด
+# ไม่มีการใช้ Prefix Command ("!") ใด ๆ (ไม่มี @bot.command หรือ
+# on_message ที่ประมวลผลเนื้อหาข้อความ) ดังนั้น Privileged
+# "Message Content Intent" จึงไม่จำเป็นต่อการทำงานของคำสั่งใด ๆ เลย
+# คำเตือนนี้เป็นคำเตือนมาตรฐานของ discord.py ที่ขึ้นทุกครั้งเมื่อมีการ
+# ตั้งค่า command_prefix โดยไม่เปิด message_content intent - ไม่ได้
+# บ่งบอกว่าคำสั่ง Slash Command จะใช้งานไม่ได้แต่อย่างใด จึงกรอง log
+# บรรทัดนี้ทิ้งเพื่อลด Noise โดยไม่กระทบการทำงานของระบบคำสั่งเดิม
+
+class _SuppressMessageContentWarning(logging.Filter):
+
+    def filter(self, record):
+
+        return "Privileged message content intent is missing" not in record.getMessage()
+
+
+logging.getLogger("discord.ext.commands.bot").addFilter(
+    _SuppressMessageContentWarning()
+)
 
 
 # =========================================================
@@ -551,42 +577,6 @@ async def safe_error_reply(
 
 
 # =========================================================
-# INTERACTION DEFER HELPER
-# =========================================================
-
-async def safe_defer(
-    interaction: discord.Interaction,
-    *,
-    ephemeral: bool = False
-):
-    """
-    Defer Interaction safely when an operation may take longer than Discord's
-    initial response window. Returns True when a defer was performed.
-    If the interaction was already acknowledged, it simply returns False.
-    """
-
-    try:
-
-        if interaction.response.is_done():
-
-            return False
-
-        await interaction.response.defer(
-            ephemeral=ephemeral
-        )
-
-        return True
-
-    except Exception:
-
-        log.exception(
-            "Failed to defer interaction"
-        )
-
-        return False
-
-
-# =========================================================
 # EMBED / TEXT LIMIT HELPERS
 # =========================================================
 
@@ -722,6 +712,58 @@ class LevelingXBot(
 
         self.bot_start_time = time.time()
 
+    def _build_commands_signature(
+        self,
+        guild: discord.Object
+    ):
+        """
+        สร้างลายเซ็น (hash) ของชุดคำสั่ง Slash Command ปัจจุบัน (ชื่อ,
+        คำอธิบาย, พารามิเตอร์) เพื่อใช้เปรียบเทียบว่าคำสั่งมีการ
+        เปลี่ยนแปลงจริงหรือไม่ ก่อนจะยิง tree.sync() ไปยัง Discord API
+        ป้องกันไม่ให้ทุกครั้งที่บอท Restart (เช่นตอนเกิด Crash Loop)
+        ต้องยิง Sync ซ้ำโดยไม่จำเป็น ซึ่งเป็นสาเหตุหนึ่งที่ทำให้โดน
+        Rate Limit (429) หนักขึ้น
+        """
+
+        commands_list = self.tree.get_commands(
+            guild=guild
+        )
+
+        signature_items = []
+
+        for cmd in sorted(
+            commands_list,
+            key=lambda c: c.name
+        ):
+
+            options = []
+
+            if isinstance(cmd, app_commands.Command):
+
+                for param in cmd.parameters:
+
+                    options.append([
+                        param.name,
+                        str(param.type),
+                        bool(param.required)
+                    ])
+
+            signature_items.append({
+                "name": cmd.name,
+                "description": cmd.description,
+                "options": options
+            })
+
+        raw = json.dumps(
+            signature_items,
+            sort_keys=True,
+            ensure_ascii=False
+        )
+
+        return hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()
+
     async def setup_hook(
         self
     ):
@@ -741,6 +783,13 @@ class LevelingXBot(
         # ---------------------------------------------
         # Sync เฉพาะ Server ส่วนตัว
         # ---------------------------------------------
+        # ยิง tree.sync() เฉพาะเมื่อชุดคำสั่งเปลี่ยนแปลงจริง หรือยังไม่เคย
+        # Sync มาก่อนเท่านั้น เพื่อลดจำนวนครั้งที่เรียก Discord API โดย
+        # ไม่จำเป็น (โดยเฉพาะตอนบอท Restart ถี่ ๆ) ซึ่งเป็นสาเหตุหนึ่งที่
+        # ทำให้เจอ 429 Too Many Requests ง่ายขึ้น
+        # สามารถบังคับ Sync ใหม่เสมอได้ด้วยการตั้ง Environment Variable
+        # FORCE_COMMAND_SYNC=1 (เช่น หลัง Deploy โค้ดที่เพิ่ม/แก้คำสั่งใหม่)
+        # ---------------------------------------------
 
         if GUILD_ID:
 
@@ -752,14 +801,70 @@ class LevelingXBot(
                 guild=guild
             )
 
-            await self.tree.sync(
-                guild=guild
+            try:
+
+                current_signature = self._build_commands_signature(
+                    guild
+                )
+
+            except Exception:
+
+                log.exception(
+                    "Failed to build command signature - will sync to be safe"
+                )
+
+                current_signature = None
+
+            stored_signature = data.get(
+                "_last_synced_command_signature"
             )
 
-            log.info(
-                "Commands synced to guild %s",
-                GUILD_ID
+            force_sync = os.getenv(
+                "FORCE_COMMAND_SYNC",
+                ""
+            ).strip() == "1"
+
+            needs_sync = (
+                force_sync
+                or current_signature is None
+                or current_signature != stored_signature
             )
+
+            if needs_sync:
+
+                try:
+
+                    synced = await self.tree.sync(
+                        guild=guild
+                    )
+
+                    if current_signature is not None:
+
+                        data["_last_synced_command_signature"] = current_signature
+
+                        await persist_data()
+
+                    log.info(
+                        "Commands synced to guild %s (%d commands)",
+                        GUILD_ID,
+                        len(synced)
+                    )
+
+                except discord.HTTPException:
+
+                    log.exception(
+                        "Failed to sync commands to guild %s (will retry on next "
+                        "successful startup)",
+                        GUILD_ID
+                    )
+
+            else:
+
+                log.info(
+                    "Command definitions unchanged - skipping tree.sync() "
+                    "for guild %s to avoid unnecessary Discord API calls",
+                    GUILD_ID
+                )
 
         # ---------------------------------------------
         # Voice Reconnect Loop
@@ -980,7 +1085,7 @@ class ReportModal(
             if not interaction.guild:
 
                 await interaction.response.send_message(
-                    "ไม่สามารถใช้ระบบนี้ใน DM ได้",
+                    "❌ ไม่สามารถใช้ระบบนี้ใน DM ได้",
                     ephemeral=True
                 )
 
@@ -997,7 +1102,7 @@ class ReportModal(
             if not channel_id:
 
                 await interaction.response.send_message(
-                    "ยังไม่ได้ตั้งห้องรับ Report\n"
+                    "❌ ยังไม่ได้ตั้งห้องรับ Report\n"
                     "ให้หัวดิสใช้ `/set channel` ก่อน",
                     ephemeral=True
                 )
@@ -1021,20 +1126,11 @@ class ReportModal(
                 return
 
             # -----------------------------------------
-            # Defer ก่อนทำงานที่อาจใช้เวลาเกิน 3 วินาที
-            # -----------------------------------------
-
-            await safe_defer(
-                interaction,
-                ephemeral=True
-            )
-
-            # -----------------------------------------
             # Embed
             # -----------------------------------------
 
             embed = discord.Embed(
-                title="มีการแจ้งปัญหาใหม่เข้ามาค่ะ",
+                title="🚨 มีการแจ้งปัญหาใหม่เข้ามาค่ะ!",
                 color=discord.Color.red(),
                 timestamp=datetime.now(
                     timezone.utc
@@ -1043,13 +1139,13 @@ class ReportModal(
 
             # ไม่ใส่ User ID
             embed.add_field(
-                name="ผู้ส่งรายงาน",
+                name="👤 ผู้ส่งรายงาน",
                 value=interaction.user.mention,
                 inline=False
             )
 
             embed.add_field(
-                name="ชื่อในฟอร์ม",
+                name="🧰 ชื่อในฟอร์ม",
                 value=truncate_field_value(
                     self.form_name.value
                 ),
@@ -1057,7 +1153,7 @@ class ReportModal(
             )
 
             embed.add_field(
-                name="ปัญหา",
+                name="📌 ปัญหา",
                 value=truncate_field_value(
                     self.problem.value
                 ),
@@ -1065,7 +1161,7 @@ class ReportModal(
             )
 
             embed.add_field(
-                name="เหตุผล / รายละเอียด",
+                name="💡 เหตุผล / รายละเอียด",
                 value=truncate_field_value(
                     self.reason.value or "-"
                 ),
@@ -1101,10 +1197,10 @@ class ReportModal(
                     )
 
             content = (
-                "มี Report ใหม่เข้ามา!\n"
+                "🚨 มี Report ใหม่เข้ามา!\n"
                 + " ".join(admin_mentions)
                 if admin_mentions
-                else "มี Report ใหม่เข้ามา!"
+                else "🚨 มี Report ใหม่เข้ามา!"
             )
 
             # -----------------------------------------
@@ -1124,12 +1220,11 @@ class ReportModal(
             # DM ผู้แจ้ง
             # -----------------------------------------
 
-            await interaction.edit_original_response(
-                content=(
-                    "ส่งรายงานเรียบร้อยแล้ว\n"
-                    "เมื่อทีมงานตอบรับปัญหา "
-                    "บอทจะแจ้งเตือนคุณทาง DM"
-                )
+            await interaction.response.send_message(
+                "✅ ส่งรายงานเรียบร้อยแล้ว\n"
+                "เมื่อทีมงานตอบรับปัญหา "
+                "บอทจะแจ้งเตือนคุณทาง DM",
+                ephemeral=True
             )
 
         except Exception:
@@ -1140,7 +1235,7 @@ class ReportModal(
 
             await safe_error_reply(
                 interaction,
-                "เกิดข้อผิดพลาดในการส่ง Report"
+                "❌ เกิดข้อผิดพลาดในการส่ง Report"
             )
 
 
@@ -1175,7 +1270,7 @@ class ReportPanelView(
             if not interaction.guild:
 
                 await interaction.response.send_message(
-                    "ใช้งานได้เฉพาะใน Server",
+                    "❌ ใช้งานได้เฉพาะใน Server",
                     ephemeral=True
                 )
 
@@ -1190,7 +1285,7 @@ class ReportPanelView(
             ):
 
                 await interaction.response.send_message(
-                    "ระบบ Report ยังไม่ได้ตั้งค่า",
+                    "❌ ระบบ Report ยังไม่ได้ตั้งค่า",
                     ephemeral=True
                 )
 
@@ -1208,7 +1303,7 @@ class ReportPanelView(
 
             await safe_error_reply(
                 interaction,
-                "เกิดข้อผิดพลาด"
+                "❌ เกิดข้อผิดพลาด"
             )
 
 
@@ -1253,7 +1348,7 @@ class ReportAdminView(
             ):
 
                 await interaction.response.send_message(
-                    "คุณไม่ได้รับอนุญาตให้ตอบรับปัญหา",
+                    "⛔ คุณไม่ได้รับอนุญาตให้ตอบรับปัญหา",
                     ephemeral=True
                 )
 
@@ -1262,7 +1357,7 @@ class ReportAdminView(
             if not interaction.message.embeds:
 
                 await interaction.response.send_message(
-                    "ไม่พบข้อมูล Report",
+                    "❌ ไม่พบข้อมูล Report",
                     ephemeral=True
                 )
 
@@ -1279,20 +1374,11 @@ class ReportAdminView(
                 if field.name == "🛠️ ผู้ตอบรับปัญหา":
 
                     await interaction.response.send_message(
-                        "Report นี้มีคนตอบรับไปแล้ว",
+                        "⚠️ Report นี้มีคนตอบรับไปแล้ว",
                         ephemeral=True
                     )
 
                     return
-
-            # -----------------------------------------
-            # Defer ก่อนแก้ไข Message / ส่ง DM
-            # -----------------------------------------
-
-            await safe_defer(
-                interaction,
-                ephemeral=False
-            )
 
             # -----------------------------------------
             # เปลี่ยนสี
@@ -1305,7 +1391,7 @@ class ReportAdminView(
             # -----------------------------------------
 
             embed.add_field(
-                name="ผู้ตอบรับปัญหา",
+                name="🛠️ ผู้ตอบรับปัญหา",
                 value=interaction.user.mention,
                 inline=False
             )
@@ -1336,7 +1422,7 @@ class ReportAdminView(
 
             for field in embed.fields:
 
-                if field.name == "ผู้ส่งรายงาน":
+                if field.name == "👤 ผู้ส่งรายงาน":
 
                     text = field.value
 
@@ -1368,7 +1454,7 @@ class ReportAdminView(
             # -----------------------------------------
 
             dm_embed = discord.Embed(
-                title="ทีมงานตอบรับปัญหาของคุณแล้ว",
+                title="🟡 ทีมงานตอบรับปัญหาของคุณแล้ว",
                 description=(
                     "ทีมงานได้รับเรื่องของคุณแล้ว\n"
                     "และกำลังดำเนินการตรวจสอบปัญหา"
@@ -1380,13 +1466,13 @@ class ReportAdminView(
             )
 
             dm_embed.add_field(
-                name="ปัญหา",
+                name="📌 ปัญหา",
                 value="ดูรายละเอียดจาก Report ที่คุณส่ง",
                 inline=False
             )
 
             dm_embed.add_field(
-                name="ผู้ดูแล",
+                name="🛠️ ผู้ดูแล",
                 value=interaction.user.mention,
                 inline=False
             )
@@ -1406,11 +1492,9 @@ class ReportAdminView(
                     dm_embed
                 )
 
-            await interaction.edit_original_response(
-                content=(
-                    f"{interaction.user.mention} "
-                    "ตอบรับปัญหาเรียบร้อยแล้ว"
-                ),
+            await interaction.response.send_message(
+                f"🟡 {interaction.user.mention} "
+                "ตอบรับปัญหาเรียบร้อยแล้ว",
                 allowed_mentions=discord.AllowedMentions(
                     users=True
                 )
@@ -1424,7 +1508,7 @@ class ReportAdminView(
 
             await safe_error_reply(
                 interaction,
-                "เกิดข้อผิดพลาดในการตอบรับ Report"
+                "❌ เกิดข้อผิดพลาดในการตอบรับ Report"
             )
 
     # =====================================================
@@ -1454,7 +1538,7 @@ class ReportAdminView(
             ):
 
                 await interaction.response.send_message(
-                    "คุณไม่ได้รับอนุญาตให้ปิด Report",
+                    "⛔ คุณไม่ได้รับอนุญาตให้ปิด Report",
                     ephemeral=True
                 )
 
@@ -1463,7 +1547,7 @@ class ReportAdminView(
             if not interaction.message.embeds:
 
                 await interaction.response.send_message(
-                    "ไม่พบข้อมูล Report",
+                    "❌ ไม่พบข้อมูล Report",
                     ephemeral=True
                 )
 
@@ -1472,22 +1556,13 @@ class ReportAdminView(
             embed = interaction.message.embeds[0]
 
             # -----------------------------------------
-            # Defer ก่อนแก้ไข Message / ส่ง DM
-            # -----------------------------------------
-
-            await safe_defer(
-                interaction,
-                ephemeral=False
-            )
-
-            # -----------------------------------------
             # เปลี่ยนสี
             # -----------------------------------------
 
             embed.color = discord.Color.green()
 
             embed.add_field(
-                name="ปิดเรื่องโดย",
+                name="✅ ปิดเรื่องโดย",
                 value=interaction.user.mention,
                 inline=False
             )
@@ -1520,7 +1595,7 @@ class ReportAdminView(
 
             for field in embed.fields:
 
-                if field.name == "ผู้ส่งรายงาน":
+                if field.name == "👤 ผู้ส่งรายงาน":
 
                     try:
 
@@ -1550,7 +1625,7 @@ class ReportAdminView(
             if reporter:
 
                 dm_embed = discord.Embed(
-                    title="ปัญหาของคุณถูกปิดเรื่องแล้ว",
+                    title="✅ ปัญหาของคุณถูกปิดเรื่องแล้ว",
                     description=(
                         "ทีมงานดำเนินการกับ Report "
                         "ของคุณเรียบร้อยแล้ว"
@@ -1562,7 +1637,7 @@ class ReportAdminView(
                 )
 
                 dm_embed.add_field(
-                    name="ผู้ปิดเรื่อง",
+                    name="🛠️ ผู้ปิดเรื่อง",
                     value=interaction.user.mention,
                     inline=False
                 )
@@ -1576,11 +1651,9 @@ class ReportAdminView(
                     dm_embed
                 )
 
-            await interaction.edit_original_response(
-                content=(
-                    f"ปิด Report โดย "
-                    f"{interaction.user.mention}"
-                ),
+            await interaction.response.send_message(
+                f"✅ ปิด Report โดย "
+                f"{interaction.user.mention}",
                 allowed_mentions=discord.AllowedMentions(
                     users=True
                 )
@@ -1594,7 +1667,7 @@ class ReportAdminView(
 
             await safe_error_reply(
                 interaction,
-                "เกิดข้อผิดพลาดในการปิด Report"
+                "❌ เกิดข้อผิดพลาดในการปิด Report"
             )
 
 
@@ -1604,7 +1677,7 @@ class ReportAdminView(
 
 @bot.tree.command(
     name="setup",
-    description="เริ่มระบบแจ้งปัญหา"
+    description="ส่งหน้าแจ้งปัญหาที่บันทึกไว้พร้อมปุ่ม"
 )
 @app_commands.guild_only()
 async def setup(
@@ -1618,7 +1691,7 @@ async def setup(
         ):
 
             await interaction.response.send_message(
-                "คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
+                "⛔ คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
                 ephemeral=True
             )
 
@@ -1663,18 +1736,14 @@ async def setup(
                 text=embed_data["footer"]
             )
 
-        await safe_defer(
-            interaction,
-            ephemeral=True
-        )
-
         await interaction.channel.send(
             embed=embed,
             view=ReportPanelView()
         )
 
-        await interaction.edit_original_response(
-            content="ส่งหน้า Report เรียบร้อยแล้ว"
+        await interaction.response.send_message(
+            "✅ ส่งหน้า Report เรียบร้อยแล้ว",
+            ephemeral=True
         )
 
     except discord.HTTPException:
@@ -1685,7 +1754,7 @@ async def setup(
 
         await safe_error_reply(
             interaction,
-            "ไม่สามารถส่งหน้า Report ได้ "
+            "❌ ไม่สามารถส่งหน้า Report ได้ "
             "อาจเป็นเพราะ URL รูปภาพไม่ถูกต้อง หรือข้อมูล Embed ที่บันทึกไว้ยาวเกินไป "
             "กรุณาใช้ `/embed create` เพื่อแก้ไขข้อมูลใหม่"
         )
@@ -1698,7 +1767,7 @@ async def setup(
 
         await safe_error_reply(
             interaction,
-            "เกิดข้อผิดพลาดในการ Setup"
+            "❌ เกิดข้อผิดพลาดในการ Setup"
         )
 
 
@@ -1708,7 +1777,7 @@ async def setup(
 
 embed_group = app_commands.Group(
     name="embed",
-    description="สร้าง embed"
+    description="สร้างและตกแต่ง Embed ของระบบ"
 )
 
 
@@ -1717,11 +1786,11 @@ embed_group = app_commands.Group(
     description="สร้างและบันทึก Embed สำหรับหน้า Report"
 )
 @app_commands.describe(
-    title="หัวข้อ Embed ใส่ก็ได้ไม่ใส่ก็ได้่",
-    description="ข้อความ Embed ใส่ก็ได้ไม่ใส่ก็ได้",
-    image="URL รูปภาพ ใส่ก็ได้ ไม่ใส่ก็ได้",
-    footer="ข้อความ Footer ใส่ก็ได้ ไม่ใส่ก็ได้",
-    color="สี Hex เช่น #5865F2 ใส่ก็ได้ไม่ใส่ก็ได้่"
+    title="หัวข้อ Embed ไม่จำเป็นต้องใส่",
+    description="ข้อความ Embed ไม่จำเป็นต้องใส่",
+    image="URL รูปภาพ ไม่จำเป็นต้องใส่",
+    footer="ข้อความ Footer ไม่จำเป็นต้องใส่",
+    color="สี Hex เช่น #5865F2 ไม่จำเป็นต้องใส่"
 )
 @app_commands.guild_only()
 async def embed_create(
@@ -1740,16 +1809,11 @@ async def embed_create(
         ):
 
             await interaction.response.send_message(
-                "คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
+                "⛔ คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
                 ephemeral=True
             )
 
             return
-
-        await safe_defer(
-            interaction,
-            ephemeral=True
-        )
 
         guild_data = get_guild_data(
             interaction.guild.id
@@ -1827,7 +1891,7 @@ async def embed_create(
             )
 
             await interaction.response.send_message(
-                "ไม่สามารถบันทึก Embed ได้ เนื่องจากเกินขีดจำกัดของ Discord:\n"
+                "❌ ไม่สามารถบันทึก Embed ได้ เนื่องจากเกินขีดจำกัดของ Discord:\n"
                 f"{error_list}",
                 ephemeral=True
             )
@@ -1878,10 +1942,11 @@ async def embed_create(
                 ]
             )
 
-        await interaction.edit_original_response(
-            content="บันทึก Embed เรียบร้อยแล้ว\n"
+        await interaction.response.send_message(
+            content="✅ บันทึก Embed เรียบร้อยแล้ว\n"
                     "ตัวอย่าง Embed:",
-            embed=embed
+            embed=embed,
+            ephemeral=True
         )
 
     except discord.HTTPException:
@@ -1892,7 +1957,7 @@ async def embed_create(
 
         await safe_error_reply(
             interaction,
-            "Discord ปฏิเสธ Embed นี้ (อาจเป็นเพราะ URL รูปภาพไม่ถูกต้อง "
+            "❌ Discord ปฏิเสธ Embed นี้ (อาจเป็นเพราะ URL รูปภาพไม่ถูกต้อง "
             "หรือข้อมูลเกินขีดจำกัด) กรุณาลองแก้ไขข้อมูลแล้วลองใหม่"
         )
 
@@ -1904,7 +1969,7 @@ async def embed_create(
 
         await safe_error_reply(
             interaction,
-            "ไม่สามารถสร้าง Embed ได้"
+            "❌ ไม่สามารถสร้าง Embed ได้"
         )
 
 
@@ -1943,7 +2008,7 @@ async def set_channel(
         ):
 
             await interaction.response.send_message(
-                "คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
+                "⛔ คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
                 ephemeral=True
             )
 
@@ -1960,7 +2025,7 @@ async def set_channel(
         await persist_data()
 
         await interaction.response.send_message(
-            f"ตั้งห้อง Report เป็น {channel.mention} แล้ว",
+            f"✅ ตั้งห้อง Report เป็น {channel.mention} แล้ว",
             ephemeral=True
         )
 
@@ -1972,7 +2037,7 @@ async def set_channel(
 
         await safe_error_reply(
             interaction,
-            "ตั้งค่าห้องไม่สำเร็จ"
+            "❌ ตั้งค่าห้องไม่สำเร็จ"
         )
 
 
@@ -1982,7 +2047,7 @@ async def set_channel(
 
 @set_group.command(
     name="admin",
-    description="เพิ่มหรือลบ คนที่สามารถตอบปัญหาได้"
+    description="เพิ่มหรือนำสมาชิกออกจากรายชื่อผู้มีสิทธิ์ตอบรับ Report"
 )
 @app_commands.describe(
     user="เลือกสมาชิกที่จะให้สิทธิ์ตอบรับ Report"
@@ -2000,7 +2065,7 @@ async def set_admin(
         ):
 
             await interaction.response.send_message(
-                "คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
+                "⛔ คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
                 ephemeral=True
             )
 
@@ -2020,7 +2085,7 @@ async def set_admin(
                 user.id
             )
 
-            status = "นำออกจากรายชื่อแล้ว"
+            status = "❌ นำออกจากรายชื่อแล้ว"
 
         else:
 
@@ -2028,7 +2093,7 @@ async def set_admin(
                 user.id
             )
 
-            status = "เพิ่มเข้าสู่รายชื่อแล้ว"
+            status = "✅ เพิ่มเข้าสู่รายชื่อแล้ว"
 
         await persist_data()
 
@@ -2046,7 +2111,7 @@ async def set_admin(
 
         await safe_error_reply(
             interaction,
-            "ตั้งค่า Admin ไม่สำเร็จ"
+            "❌ ตั้งค่า Admin ไม่สำเร็จ"
         )
 
 
@@ -2061,7 +2126,7 @@ bot.tree.add_command(
 
 @bot.tree.command(
     name="ping",
-    description="แสดงค่าปิงบอท"
+    description="แสดงค่าปิงของบอท"
 )
 async def ping(
     interaction: discord.Interaction
@@ -2082,14 +2147,14 @@ async def ping(
 
 @bot.tree.command(
     name="help",
-    description="ดูคำสั่งทั้งหมด"
+    description="แสดงรายการคำสั่งทั้งหมดของบอท"
 )
 async def help_command(
     interaction: discord.Interaction
 ):
 
     embed = discord.Embed(
-        title="คำสั่งทั้งหมด",
+        title="📚 คำสั่งของ LevelingX",
         color=discord.Color.blurple()
     )
 
@@ -2116,7 +2181,7 @@ async def help_command(
 
 @bot.tree.command(
     name="botinfo",
-    description="แสดงข้อมูลบอท"
+    description="แสดงข้อมูลเกี่ยวกับบอทและระบบที่กำลังทำงาน"
 )
 async def botinfo(
     interaction: discord.Interaction
@@ -2172,54 +2237,54 @@ async def botinfo(
         )
 
         embed = discord.Embed(
-            title="bot info",
+            title="🤖 LevelingX Bot Information",
             color=discord.Color.blurple()
         )
 
         embed.add_field(
-            name="Developer",
+            name="👤 Developer",
             value="LevelingX",
             inline=False
         )
 
         embed.add_field(
-            name="Bot",
+            name="🤖 Bot",
             value=str(bot.user),
             inline=False
         )
 
         embed.add_field(
-            name="discord.py",
+            name="🧩 discord.py",
             value=discord.__version__,
             inline=True
         )
 
         embed.add_field(
-            name="Python",
+            name="🐍 Python",
             value=platform.python_version(),
             inline=True
         )
 
         embed.add_field(
-            name="OS",
+            name="💻 OS",
             value=platform.system(),
             inline=True
         )
 
         embed.add_field(
-            name="Architecture",
+            name="🏗️ Architecture",
             value=platform.machine(),
             inline=True
         )
 
         embed.add_field(
-            name="CPU",
+            name="⚙️ CPU",
             value=f"{cpu:.1f}%",
             inline=True
         )
 
         embed.add_field(
-            name="RAM",
+            name="🧠 RAM",
             value=(
                 f"{ram_used:.0f} MB / "
                 f"{ram_total:.0f} MB"
@@ -2228,7 +2293,7 @@ async def botinfo(
         )
 
         embed.add_field(
-            name="Uptime",
+            name="⏱️ Uptime",
             value=format_uptime(
                 uptime
             ),
@@ -2236,7 +2301,7 @@ async def botinfo(
         )
 
         embed.add_field(
-            name="Server",
+            name="🌐 Server",
             value=(
                 f"{len(bot.guilds)} Server"
             ),
@@ -2244,7 +2309,7 @@ async def botinfo(
         )
 
         embed.add_field(
-            name="ผู้ใช้ที่มองเห็น",
+            name="👥 ผู้ใช้ที่มองเห็น",
             value=str(
                 sum(
                     guild.member_count or 0
@@ -2255,7 +2320,7 @@ async def botinfo(
         )
 
         embed.add_field(
-            name="Voice",
+            name="🎙️ Voice",
             value=(
                 "Connected"
                 if any(
@@ -2284,7 +2349,7 @@ async def botinfo(
 
         await safe_error_reply(
             interaction,
-            "ไม่สามารถแสดงข้อมูลบอทได้"
+            "❌ ไม่สามารถแสดงข้อมูลบอทได้"
         )
 
 
@@ -2294,7 +2359,7 @@ async def botinfo(
 
 @bot.tree.command(
     name="botonline",
-    description="ออนช่องเสียง 24/7"
+    description="ตั้งห้องเสียงที่ให้บอทเข้าไปออนไลน์ตลอดเวลา"
 )
 @app_commands.describe(
     channel="เลือกห้องเสียงที่ต้องการให้บอทเข้า"
@@ -2312,16 +2377,11 @@ async def botonline(
         ):
 
             await interaction.response.send_message(
-                "คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
+                "⛔ คำสั่งนี้ใช้ได้เฉพาะหัวดิส",
                 ephemeral=True
             )
 
             return
-
-        await safe_defer(
-            interaction,
-            ephemeral=True
-        )
 
         guild_data = get_guild_data(
             interaction.guild.id
@@ -2349,18 +2409,17 @@ async def botonline(
                 reconnect=True
             )
 
-        await interaction.edit_original_response(
-            content=(
-                f"บอทเข้า {channel.mention} แล้ว\n"
-                "ระบบจะพยายามเชื่อมต่อกลับให้อัตโนมัติหากหลุด"
-            )
+        await interaction.response.send_message(
+            f"🎙️ บอทเข้า {channel.mention} แล้ว\n"
+            "ระบบจะพยายามเชื่อมต่อกลับให้อัตโนมัติหากหลุด",
+            ephemeral=True
         )
 
     except discord.Forbidden:
 
         await safe_error_reply(
             interaction,
-            "บอทไม่มีสิทธิ์เข้าหรือเชื่อมต่อห้องเสียงนี้"
+            "❌ บอทไม่มีสิทธิ์เข้าหรือเชื่อมต่อห้องเสียงนี้"
         )
 
     except discord.ClientException:
@@ -2371,8 +2430,8 @@ async def botonline(
 
         await safe_error_reply(
             interaction,
-            "ไม่สามารถเชื่อมต่อห้องเสียงได้ในขณะนี้ "
-            "บอทอยู่ในห้องเสียงอยู่แล้ว หรือ บอทบัค ให้แจ้งผู้สร้างบอท"
+            "❌ ไม่สามารถเชื่อมต่อห้องเสียงได้ในขณะนี้ "
+            "(บอทอาจกำลังเชื่อมต่ออยู่แล้ว หรือ PyNaCl ยังไม่ได้ติดตั้ง)"
         )
 
     except Exception:
@@ -2405,7 +2464,7 @@ async def on_app_command_error(
     try:
 
         message = (
-            "เกิดข้อผิดพลาดในการใช้คำสั่ง\n"
+            "❌ เกิดข้อผิดพลาดในการใช้คำสั่ง\n"
             "กรุณาลองใหม่อีกครั้ง"
         )
 
@@ -2441,7 +2500,7 @@ async def on_error(
     **kwargs
 ):
 
-    log.error(
+    log.exception(
         "Discord event error: %s",
         event
     )
@@ -2517,9 +2576,31 @@ def main():
     # แต่ถ้า Token ผิด หรือ Privileged Intents ไม่ได้เปิดใน Developer Portal
     # ถือเป็นปัญหาการตั้งค่า ไม่ใช่ปัญหาเครือข่ายชั่วคราว จึงไม่วน retry
     # ทุก 10 วินาทีแบบไม่มีที่สิ้นสุด ให้หยุดและ log สาเหตุให้ชัดเจนแทน
+    #
+    # ถ้าเจอ HTTP 429 (Too Many Requests) จะรอตามเวลาที่ Discord กำหนด
+    # (retry_after จาก header ของ Discord เอง) ก่อนค่อย reconnect ใหม่
+    # แทนที่จะ retry รัว ๆ ทุก 10 วินาทีเหมือนเดิม ซึ่งจะยิ่งซ้ำเติมปัญหา
+    # Rate Limit ให้หนักขึ้นไปอีก (ตามที่เห็นใน Log: "You are being
+    # blocked from accessing our API temporarily due to exceeding
+    # global rate limits")
+    #
+    # ส่วน Error อื่น ๆ ที่ไม่ใช่ 429 จะใช้ Exponential Backoff (เพิ่มเวลา
+    # รอเป็นเท่าตัวทุกครั้งที่ล้มเหลวติดกัน จนถึงเพดานสูงสุด) พร้อม Jitter
+    # เล็กน้อยเพื่อป้องกันการยิง Request พร้อมกันเป๊ะ ๆ ทุกครั้ง และจะ
+    # รีเซ็ตตัวนับกลับเป็นค่าเริ่มต้นเมื่อบอทสามารถรันได้เสถียรระยะหนึ่ง
+    # แล้วจึงค่อยหลุดในภายหลัง (ไม่ใช่ล้มเหลวติด ๆ กันทันที) เพื่อป้องกัน
+    # ไม่ให้เวลารอค้างอยู่ที่ค่าสูงสุดตลอดไปโดยไม่จำเป็น
     # ---------------------------------------------
 
+    BASE_BACKOFF_SECONDS = 10
+    MAX_BACKOFF_SECONDS = 300
+    STABLE_RUN_THRESHOLD_SECONDS = 120
+
+    consecutive_failures = 0
+
     while True:
+
+        run_started_at = time.time()
 
         try:
 
@@ -2563,13 +2644,147 @@ def main():
 
             break
 
+        except discord.HTTPException as error:
+
+            ran_for = time.time() - run_started_at
+
+            if ran_for > STABLE_RUN_THRESHOLD_SECONDS:
+
+                consecutive_failures = 0
+
+            if getattr(error, "status", None) == 429:
+
+                # -----------------------------------------
+                # โดน Discord Rate Limit (429) โดยตรง
+                # ให้ใช้เวลาที่ Discord กำหนดมาให้ (retry_after จาก
+                # HTTP Header "Retry-After") แทนการเดาเอง ถ้าหาค่านี้
+                # ไม่ได้จริง ๆ ค่อย fallback ไปใช้ Exponential Backoff
+                # -----------------------------------------
+
+                retry_after = getattr(
+                    error,
+                    "retry_after",
+                    None
+                )
+
+                if retry_after is None:
+
+                    response = getattr(
+                        error,
+                        "response",
+                        None
+                    )
+
+                    header_value = None
+
+                    if response is not None and getattr(
+                        response,
+                        "headers",
+                        None
+                    ):
+
+                        header_value = response.headers.get(
+                            "Retry-After"
+                        )
+
+                    if header_value:
+
+                        try:
+
+                            retry_after = float(
+                                header_value
+                            )
+
+                        except (
+                            TypeError,
+                            ValueError
+                        ):
+
+                            retry_after = None
+
+                if not retry_after or retry_after <= 0:
+
+                    retry_after = min(
+                        BASE_BACKOFF_SECONDS * (2 ** consecutive_failures),
+                        MAX_BACKOFF_SECONDS
+                    )
+
+                # เผื่อเวลาเพิ่มเล็กน้อยกันกรณี Clock/Network คลาดเคลื่อน
+                wait_seconds = retry_after + random.uniform(1, 3)
+
+                consecutive_failures += 1
+
+                log.error(
+                    "โดน Discord API 429 Too Many Requests - รอ %.1f วินาที "
+                    "ตามที่ Discord กำหนด (retry_after) ก่อน reconnect ใหม่ "
+                    "(ครั้งที่ล้มเหลวติดกัน: %d)",
+                    wait_seconds,
+                    consecutive_failures
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+            else:
+
+                # -----------------------------------------
+                # HTTP Error อื่นที่ไม่ใช่ 429 (เช่น 500, 502, 503)
+                # ใช้ Exponential Backoff เช่นกัน ไม่ reconnect รัว ๆ
+                # -----------------------------------------
+
+                wait_seconds = min(
+                    BASE_BACKOFF_SECONDS * (2 ** consecutive_failures),
+                    MAX_BACKOFF_SECONDS
+                ) + random.uniform(0, 2)
+
+                consecutive_failures += 1
+
+                log.exception(
+                    "Discord HTTPException (status: %s) - รอ %.1f วินาที "
+                    "ก่อนลองเชื่อมต่อใหม่ (ครั้งที่ล้มเหลวติดกัน: %d)",
+                    getattr(error, "status", "unknown"),
+                    wait_seconds,
+                    consecutive_failures
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
         except Exception:
 
+            # -----------------------------------------
+            # Error อื่น ๆ ที่ไม่คาดคิด (network ล่ม, gateway หลุดแรง ฯลฯ)
+            # ใช้ Exponential Backoff แทนการรอคงที่ 10 วินาทีทุกครั้ง
+            # เพื่อไม่ให้ยิง Discord API ถี่เกินไปจนซ้ำเติม Rate Limit
+            # -----------------------------------------
+
+            ran_for = time.time() - run_started_at
+
+            if ran_for > STABLE_RUN_THRESHOLD_SECONDS:
+
+                # บอทรันได้เสถียรมาสักพักก่อนจะล้มเหลว ถือว่าไม่ใช่
+                # ปัญหาวนซ้ำ ๆ ทันที จึงรีเซ็ตตัวนับ Backoff กลับ
+                consecutive_failures = 0
+
+            wait_seconds = min(
+                BASE_BACKOFF_SECONDS * (2 ** consecutive_failures),
+                MAX_BACKOFF_SECONDS
+            ) + random.uniform(0, 2)
+
+            consecutive_failures += 1
+
             log.exception(
-                "Bot crashed unexpectedly. Restarting in 10 seconds..."
+                "Bot crashed unexpectedly. Restarting in %.1f seconds "
+                "(consecutive failures: %d)...",
+                wait_seconds,
+                consecutive_failures
             )
 
-            time.sleep(10)
+            time.sleep(
+                wait_seconds
+            )
 
 
 if __name__ == "__main__":
